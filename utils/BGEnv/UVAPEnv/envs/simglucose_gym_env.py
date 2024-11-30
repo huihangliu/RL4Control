@@ -21,13 +21,18 @@ from gymnasium import spaces
 from gymnasium.utils import seeding
 from datetime import datetime
 import warnings
+import os, struct, hashlib
+from typing import Any, List, Optional, Tuple, Union
+from gymnasium.logger import deprecation
+import matplotlib.pyplot as plt
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 """
 Huihang debug: 
-    1. Modify simglucose_gym.py my_seed() at line 745. 
+    1. Modify simglucose_gym_env.py _seed() at line 745. 
 """
+
 
 # %%
 class DeepSACT1DEnv(gym.Env):
@@ -56,16 +61,16 @@ class DeepSACT1DEnv(gym.Env):
         action_cap=0.1,
         action_bias=0,
         action_scale=1,
-        basal_scaling=216.0,  # basal_scaling is 43.2
+        basal_scaling=216.0,  # Fox used 43.2
         meal_announce=None,
         residual_basal=False,
         residual_bolus=False,
         residual_PID=False,
-        fake_gt=False,
+        fake_gt=False,  # fake_ground_truth?
         fake_real=False,
         suppress_carbs=False,
         limited_gt=False,
-        termination_penalty=1e5,
+        termination_penalty=None,  # origin is None
         weekly=False,
         use_model=False,
         model=None,
@@ -91,12 +96,13 @@ class DeepSACT1DEnv(gym.Env):
         carb_error_std=0,
         carb_miss_prob=0,
         source_dir=None,
-        time_limit=24 * 60 / 5 * 3, # huihang add this variable, in the fox paper it should be 20 days
+        time_limit=24 * 60 / 5 * 3,  # debug, in Fox' paper it'd be 20 days
+        log_dir=None,
+        verbose=False,
         **kwargs,
     ):
         """
-        patient_name must be 'adolescent#001' to 'adolescent#010',
-        or 'adult#001' to 'adult#010', or 'child#001' to 'child#010'
+        patient_name must be 'adolescent#001' to 'adolescent#010', or 'adult#001' to 'adult#010', or 'child#001' to 'child#010'
         """
         super(DeepSACT1DEnv, self).__init__()
         self.source_dir = source_dir
@@ -124,7 +130,7 @@ class DeepSACT1DEnv(gym.Env):
         )
         self.universal = universal
         if seeds is None:
-            seed_list = self.my_seed()
+            seed_list = self._seed()
             seeds = Seed(
                 numpy_seed=seed_list[0],
                 sensor_seed=seed_list[1],
@@ -134,19 +140,19 @@ class DeepSACT1DEnv(gym.Env):
             if self.universal:
                 patient_name = np.random.choice(self.universe)
             else:
-                # patient_name = 'adolescent#001'
-                patient_name = self.universe[11]
-        # raise an error, show the seeds.numpy_seed
-        # raise ValueError(seeds.numpy_seed)
+                patient_name = "adolescent#001"
+                # patient_name = self.universe[11]
         np.random.seed(seeds.numpy_seed)
         self.seeds = seeds
-        self.sample_time = 5  # 5 minutes per sample
+        self.sample_time = (
+            5  # 5 minutes per sample ? in T1SinEnv.Step() it loop for self.sample_time
+        )
         self.day = int(
             1440 / self.sample_time
         )  # 1440 minutes per day, 288 samples per day
         self.state_hist = int(
             (n_hours * 60) / self.sample_time
-        )  # state_hist 长度为, 即保留的历史数据长度, 是否应该是 4 小时 ??
+        )  # state_hist 长度为, 即保留的历史数据长度, 4 小时
         self.time = time
         self.meal = meal
         self.norm = norm
@@ -192,9 +198,12 @@ class DeepSACT1DEnv(gym.Env):
                 0,
                 0,
             )
-        assert bw_meals  # otherwise code wouldn't make sense
+        assert bw_meals  # otherwise code wouldn't make sense, ?? what is this?
         if reset_lim is None:
-            self.reset_lim = {"lower_lim": 10, "upper_lim": 1000}
+            self.reset_lim = {
+                "lower_lim": 5,  # huihang modified
+                "upper_lim": 1000,
+            }  # original value: 10, 1000
         else:
             self.reset_lim = reset_lim
         self.load = load
@@ -218,6 +227,8 @@ class DeepSACT1DEnv(gym.Env):
             patient_name
         )  # 设置 patient_name 对应的参数, 进行初始化操作
         self.env.scenario.day = 0
+        self.log_dir = log_dir if log_dir is not None else "./results/"
+        self.verbose = verbose
 
     def pid_load(self, n_days):
         for i in range(n_days * self.day):
@@ -226,9 +237,7 @@ class DeepSACT1DEnv(gym.Env):
             _ = self.env.step(action=act, reward_fun=self.reward_fun, cho=None)
 
     def step(self, action):
-        # 注意, 这里的 action 需要 scale, 因为需要输入 [-1, 1] 之间的值. MPC 方法不需要, 所以这里需要注意. MPC 方法使用这个环境时, 需要取消 scale.
-        # action = 0.4 * action
-        return self.my_step(action, cho=None)
+        return self._step(action, cho=None)
 
     def translate(self, action):
         if self.action_scale == "basal":
@@ -242,20 +251,12 @@ class DeepSACT1DEnv(gym.Env):
             action = (action + self.action_bias) * self.action_scale
         return max(0, action)
 
-    def my_step(self, action, cho=None, use_action_scale=True):
+    def _step(self, action, cho=None, use_action_scale=True):
         # cho controls if carbs are eaten, else taken from meal policy
         if type(action) is np.ndarray:
             action = action.item()
         if use_action_scale:
-            if self.action_scale == "basal":
-                # 288 samples per day, bolus insulin should be 75% of insulin dose
-                # split over 4 meals with 5 minute sampling rate, max unscaled value is 1+action_bias
-                # https://care.diabetesjournals.org/content/34/5/1089
-                action = (action + self.action_bias) * (
-                    (self.ideal_basal * self.basal_scaling) / (1 + self.action_bias)
-                )
-            else:
-                action = (action + self.action_bias) * self.action_scale
+            action = self.translate(action)
         if self.residual_basal:
             action += self.ideal_basal
         if self.residual_bolus:
@@ -303,89 +304,15 @@ class DeepSACT1DEnv(gym.Env):
         if done and self.termination_penalty is not None:
             reward = reward - self.termination_penalty
         reward = reward + self.reward_bias
-        truncated = (
-            False if len(self.env.CGM_hist) < 24 * 60 / 5 + self.time_limit else True
-        )  # max number of steps per episode, 20 days
-        # print(f"Debug simglucose_gym.py: action: {action}, state: {state}, reward: {reward}")
+        if self.hist_init:
+            truncated = (
+                False
+                if len(self.env.CGM_hist) < 24 * 60 / 5 + self.time_limit
+                else True
+            )  # max number of steps per episode
+        else:
+            truncated = False if len(self.env.CGM_hist) < self.time_limit else True
 
-        if done or truncated:
-            # huihang debug, print the curve before each reset
-            import matplotlib.pyplot as plt
-
-            df = pd.DataFrame()
-            df["Time"] = pd.Series(self.env.time_hist)
-            df["BG"] = pd.Series(self.env.BG_hist)
-            df["CGM"] = pd.Series(self.env.CGM_hist)
-            df["CHO"] = pd.Series(self.env.CHO_hist)
-            df["insulin"] = pd.Series(self.env.insulin_hist)
-            df["LBGI"] = pd.Series(self.env.LBGI_hist)
-            df["HBGI"] = pd.Series(self.env.HBGI_hist)
-            df["Risk"] = pd.Series(self.env.risk_hist)
-            df["Magni_Risk"] = pd.Series(self.env.magni_risk_hist)
-
-            df["Time"] = pd.to_datetime(df["Time"])
-            # turn time into minutes
-            df["Time"] = (
-                (df["Time"] - df["Time"].iloc[0]).dt.total_seconds() / 60 / 60
-            )  # hours
-
-            glucose_levels = df["CGM"]
-            insulin_rates = df["insulin"]  # Assuming this column exists
-            rewards_steps = df[
-                "Magni_Risk"
-            ]  # Assuming this represents some form of reward
-
-            meal_times = df["Time"][df["CHO"] > 0]
-            meal_amounts = df["CHO"][df["CHO"] > 0]
-            x_range = (0, 91)  # Set the x-axis range
-
-            plt.figure(figsize=(12, 12))
-            ax1 = plt.subplot(2, 1, 1)
-
-            color = "tab:red"
-            ax1.set_xlabel("Time (Days)")
-            ax1.set_ylabel("Glucose Level (mg/dL)", color=color)
-            ax1.plot(df["Time"], df["CGM"], color=color, label="Glucose Level")
-            ax1.plot(df["Time"], df["BG"], color="black", linestyle="--", label="BG")
-            for meal_time in meal_times:
-                ax1.axvline(x=meal_time, color="blue", linestyle="--", linewidth=1)
-            ax1.tick_params(axis="y", labelcolor=color)
-
-            ax1.axhline(y=80, color="green", linestyle="--", label="Lower Target")
-            ax1.axhline(y=140, color="green", linestyle="--")
-            ax1.set_xlim(x_range)
-            ax1.set_ylim(10, 300)
-
-            ax2 = ax1.twinx()  # Second axes for insulin rates
-            color = "tab:blue"
-            ax2.set_ylabel("Insulin Infusion Rate", color=color)
-            ax2.plot(df["Time"], insulin_rates, color=color, alpha=0.2)
-            ax2.tick_params(axis="y", labelcolor=color)
-            # please set the x-axis to display the following values: 8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72
-            ax2.set_xticks(
-                [8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96]
-            )
-            ax2.set_ylim(0, 1.0)
-
-            # Plot for rewards
-            plt.subplot(2, 1, 2)
-            plt.plot(df["Time"], rewards_steps, color="blue", label="Risk")
-            plt.xlabel("Time (Days)")
-            plt.ylabel("Risk")
-            plt.xlim(x_range)
-            # please set_xticks([8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96])
-            plt.xticks([8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96])
-
-            plt.tight_layout()
-
-            # Adjust title and save logic according to your needs
-            plt.suptitle("Glucose Level and Insulin Infusion Rate Over Time")
-            time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            plt.savefig(
-                f"./backup/fig/debug/RL_v3_debug_glucose_insulin.{time_start}.png"
-            )
-            # plt.show()
-            plt.close()
         return (
             state.astype(np.float32),
             reward.astype(np.float32),
@@ -413,13 +340,14 @@ class DeepSACT1DEnv(gym.Env):
         return 0, 0
 
     def calculate_iob(self):
+        # calculate IOB based on last 288 samples, IOB is the sum of insulin in the last 3 hours
         ins = self.env.insulin_hist
         return np.dot(np.flip(self.iob, axis=0)[-len(ins) :], ins[-len(self.iob) :])
 
     def get_state(self, normalize=False):
         bg = self.env.CGM_hist[
             -self.state_hist :
-        ]  # 如果 self.hist_init==True, 则初始长度为 self.state_hist, 否则初始为 1.
+        ]  # 如果 self.hist_init==True, 则 self.env.CGM_hist 的初始长度为 self.state_hist, 否则初始为 1.
         insulin = self.env.insulin_hist[
             -self.state_hist :
         ]  # at most 288 samples, initial length is 1
@@ -538,7 +466,7 @@ class DeepSACT1DEnv(gym.Env):
         return bg, euglycemic, hypo, hyper, ins
 
     def is_done(self):
-        # print(f"Debug simglucose_gym.py is_done(): BG_hist[-1]: {self.env.BG_hist[-1] < self.reset_lim['lower_lim']}, reset_lim: {self.env.BG_hist[-1] > self.reset_lim['upper_lim']}")
+        return False
         return (
             self.env.BG_hist[-1] < self.reset_lim["lower_lim"]
             or self.env.BG_hist[-1] > self.reset_lim["upper_lim"]
@@ -550,8 +478,7 @@ class DeepSACT1DEnv(gym.Env):
         self.seeds.sensor_seed += incr
 
     def reset(self, seed=None, return_info=None, options=None):
-        # tmp_info = False
-        return self.my_reset()
+        return self._reset()
 
     def set_patient_dependent_values(self, patient_name):
         self.patient_name = patient_name
@@ -560,12 +487,14 @@ class DeepSACT1DEnv(gym.Env):
         self.kind = self.patient_name.split("#")[0]
         self.bw = vpatient_params.query('Name=="{}"'.format(self.patient_name))[
             "BW"
-        ].item()
+        ].item()  # bw is body weight
         self.u2ss = vpatient_params.query('Name=="{}"'.format(self.patient_name))[
             "u2ss"
-        ].item()
+        ].item()  # u2ss is steady state basal insulin
         self.ideal_basal = self.bw * self.u2ss / 6000.0
-        self.CR = quest.query('Name=="{}"'.format(patient_name)).CR.item()
+        self.CR = quest.query(
+            'Name=="{}"'.format(patient_name)
+        ).CR.item()  # 这些量可以在 UVa/P 的文章里找.
         self.CF = quest.query('Name=="{}"'.format(patient_name)).CF.item()
         if self.rolling_insulin_lim is not None:
             self.rolling_insulin_lim = (
@@ -639,9 +568,9 @@ class DeepSACT1DEnv(gym.Env):
             self.env_init_dict["magni_risk_hist"] = []
             for bg in self.env_init_dict["bg_hist"]:  # length 298
                 self.env_init_dict["magni_risk_hist"].append(magni_risk_index([bg]))
-            self.my_hist_init()
+            self._hist_init()
 
-    def my_reset(self, seed=None, return_info=False, options=None):
+    def _reset(self, seed=None, return_info=False, options=None):
         if self.update_seed_on_reset:
             self.increment_seed()
         if self.use_model:
@@ -696,14 +625,15 @@ class DeepSACT1DEnv(gym.Env):
                 if self.use_pid_load:
                     self.pid_load(1)
                 if self.hist_init:
-                    self.my_hist_init()
+                    self._hist_init()
 
-        #
+        # self._plot_episode(), call _plot_episode() outside of the class
+
         info = {}
 
         return self.get_state(self.norm), info
 
-    def my_hist_init(self):
+    def _hist_init(self):
         self.rolling = []
         env_init_dict = copy.deepcopy(self.env_init_dict)
         self.env.patient._state = env_init_dict["state"]
@@ -732,38 +662,204 @@ class DeepSACT1DEnv(gym.Env):
         self.env.insulin_hist = env_init_dict["insulin_hist"]
         self.env.magni_risk_hist = env_init_dict["magni_risk_hist"]
 
-    def my_seed(self, seed=None):
+    def _seed(self, seed=None):
         self.np_random, seed1 = seeding.np_random(seed=seed)
         # Derive a random seed. This is manually seeded to avoid issues
         seed1 = seed1 % 2**31
-        seed2 = (seed1 + 2024) % 2**31
-        seed3 = (seed2 + 2024) % 2**31
+        seed2 = self.hash_seed(seed1 + 1) % 2**31
+        seed3 = self.hash_seed(seed2 + 1) % 2**31
 
         # huihang debug
-        if False:
+        if True:
             return [seed1, seed2, seed3]
         else:
-            # print(f"Modify simglucose_gym.py my_seed()")
+            # print(f"Modify simglucose_gym.py _seed()")
             return [2024, 2024, 2024]
+
+    @staticmethod
+    def _bigint_from_bytes(bt: bytes) -> int:
+        deprecation(
+            "Function `_bigint_from_bytes(bytes)` is marked as deprecated and will be removed in the future. "
+        )
+        sizeof_int = 4
+        padding = sizeof_int - len(bt) % sizeof_int
+        bt += b"\0" * padding
+        int_count = int(len(bt) / sizeof_int)
+        unpacked = struct.unpack(f"{int_count}I", bt)
+        accum = 0
+        for i, val in enumerate(unpacked):
+            accum += 2 ** (sizeof_int * 8 * i) * val
+        return accum
+
+    def create_seed(
+        self, a: Optional[Union[int, str]] = None, max_bytes: int = 8
+    ) -> int:
+        """Create a strong random seed.
+
+        Otherwise, Python 2 would seed using the system time, which might be non-robust especially in the presence of concurrency.
+
+        Args:
+            a: None seeds from an operating system specific randomness source.
+            max_bytes: Maximum number of bytes to use in the seed.
+
+        Returns:
+            A seed
+
+        Raises:
+            Error: Invalid type for seed, expects None or str or int
+        """
+        deprecation(
+            "Function `create_seed(a, max_bytes)` is marked as deprecated and will be removed in the future. "
+        )
+        # Adapted from https://svn.python.org/projects/python/tags/r32/Lib/random.py
+        if a is None:
+            a = self._bigint_from_bytes(os.urandom(max_bytes))
+        elif isinstance(a, str):
+            bt = a.encode("utf8")
+            bt += hashlib.sha512(bt).digest()
+            a = self._bigint_from_bytes(bt[:max_bytes])
+        elif isinstance(a, int):
+            a = int(a % 2 ** (8 * max_bytes))
+        else:
+            raise error.Error(f"Invalid type for seed: {type(a)} ({a})")
+
+        return a
+
+    def hash_seed(self, seed: Optional[int] = None, max_bytes: int = 8) -> int:
+        """Any given evaluation is likely to have many PRNG's active at once.
+
+        (Most commonly, because the environment is running in multiple processes.)
+        There's literature indicating that having linear correlations between seeds of multiple PRNG's can correlate the outputs:
+            http://blogs.unity3d.com/2015/01/07/a-primer-on-repeatable-random-numbers/
+            http://stackoverflow.com/questions/1554958/how-different-do-random-seeds-need-to-be
+            http://dl.acm.org/citation.cfm?id=1276928
+        Thus, for sanity we hash the seeds before using them. (This scheme is likely not crypto-strength, but it should be good enough to get rid of simple correlations.)
+
+        Args:
+            seed: None seeds from an operating system specific randomness source.
+            max_bytes: Maximum number of bytes to use in the hashed seed.
+
+        Returns:
+            The hashed seed
+        """
+        deprecation(
+            "Function `hash_seed(seed, max_bytes)` is marked as deprecated and will be removed in the future. "
+        )
+        if seed is None:
+            seed = self.create_seed(max_bytes=max_bytes)
+        hash = hashlib.sha512(str(seed).encode("utf8")).digest()
+        return self._bigint_from_bytes(hash[:max_bytes])
+
+    def _plot_episode(self, log_dir=None):
+        if log_dir is None:
+            log_dir = self.log_dir
+
+        df = pd.DataFrame()
+        df["Time"] = pd.Series(self.env.time_hist)
+        df["BG"] = pd.Series(self.env.BG_hist)
+        df["CGM"] = pd.Series(self.env.CGM_hist)
+        df["CHO"] = pd.Series(self.env.CHO_hist)
+        df["insulin"] = pd.Series(self.env.insulin_hist)
+        df["LBGI"] = pd.Series(self.env.LBGI_hist)
+        df["HBGI"] = pd.Series(self.env.HBGI_hist)
+        df["Risk"] = pd.Series(self.env.risk_hist)
+        df["Magni_Risk"] = pd.Series(self.env.magni_risk_hist)
+
+        df["Time"] = pd.to_datetime(df["Time"])
+        # turn time into minutes
+        df["Time"] = (
+            (df["Time"] - df["Time"].iloc[0]).dt.total_seconds() / 60 / 60
+        )  # hours
+
+        glucose_levels = df["CGM"]
+        insulin_rates = df["insulin"]  # Assuming this column exists
+        rewards_steps = df["Magni_Risk"]  # Assuming this represents some form of reward
+
+        meal_times = df["Time"][df["CHO"] > 0]
+        meal_amounts = df["CHO"][df["CHO"] > 0]
+        x_range = (0, 91)  # Set the x-axis range
+
+        plt.figure(figsize=(12, 12))
+        ax1 = plt.subplot(2, 1, 1)
+
+        color = "tab:red"
+        ax1.set_xlabel("Time (Days)")
+        ax1.set_ylabel("Glucose Level (mg/dL)", color=color)
+        ax1.plot(df["Time"], df["CGM"], color=color, label="CGM")
+        ax1.plot(df["Time"], df["BG"], color="black", linestyle="--", label="BG")
+        for meal_time in meal_times:
+            ax1.axvline(x=meal_time, color="blue", linestyle="--", linewidth=1)
+        ax1.tick_params(axis="y", labelcolor=color)
+
+        ax1.axhline(y=80, color="green", linestyle="--", label="Lower Target")
+        ax1.axhline(y=140, color="green", linestyle="--")
+        ax1.set_xlim(x_range)
+        ax1.set_ylim(10, 300)
+
+        ax2 = ax1.twinx()  # Second axes for insulin rates
+        color = "tab:blue"
+        ax2.set_ylabel("Insulin Infusion Rate", color=color)
+        ax2.plot(df["Time"], insulin_rates, color=color, alpha=0.2)
+        ax2.tick_params(axis="y", labelcolor=color)
+        # please set the x-axis to display the following values: 8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72
+        ax2.set_xticks([8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96])
+        ax2.set_ylim(0, 0.5)  # insulin rate range
+
+        # Plot for rewards
+        plt.subplot(2, 1, 2)
+        plt.plot(df["Time"], rewards_steps, color="blue", label="Risk")
+        plt.xlabel("Time (Days)")
+        plt.ylabel("Risk")
+        # show cumulative reward as a note on the plot
+        plt.text(
+            0.5,
+            0.5,
+            f"Total Risk: {np.sum(rewards_steps):.4f}",
+            fontsize=12,
+            transform=plt.gcf().transFigure,
+        )
+        # show patient name as a note on the plot
+        plt.text(
+            0.2,
+            0.5,
+            f"Patient: {self.patient_name}",
+            fontsize=12,
+            transform=plt.gcf().transFigure,
+        )
+        plt.xlim(x_range)
+        # please set_xticks([8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96])
+        plt.xticks([8, 12, 18, 24, 32, 36, 42, 48, 56, 60, 66, 72, 80, 84, 90, 96])
+
+        plt.tight_layout()
+
+        # Adjust title and save logic according to your needs
+        plt.suptitle("Glucose Level and Insulin Infusion Rate Over Time")
+        cur_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        plt.savefig(f"{log_dir}{cur_time}.png")
+        # plt.show()
+        plt.close()
 
     @property
     def action_space(self):
-        # return spaces.Box(low=0, high=0.1, shape=(1,))
+        # previously: return spaces.Box(low=0, high=0.1, shape=(1,))
+        # Since SB3 requires a symmetric action space, we use the following, and rescale the action in the environment
         return spaces.Box(low=-1.0, high=1.0, shape=(1,))
 
     @property
     def observation_space(self):
         st = self.get_state()  # np.array, length 576
-        if self.gt:  # if Oracle
+        if self.gt:  # flag: use ground truth
             return spaces.Box(low=0, high=np.inf, shape=(len(st),))
-        else:  # if not Oracle
+        else:
             num_channels = int(len(st) / self.state_hist)
-            return spaces.Box(
-                low=0, high=np.inf, shape=(num_channels * self.state_hist,)
-            )
 
-        # huihang debug
-        # return spaces.Box(low=np.array([0.0]*6), high=np.array([np.inf]*6), dtype=np.float32)
+            return spaces.Box(
+                low=0,
+                high=np.inf,
+                shape=(num_channels * self.state_hist,),
+                # low=0, high=np.inf, shape=(num_channels, self.state_hist),
+                # modified: num_channels * self.state_hist
+            )
 
 
 # %%

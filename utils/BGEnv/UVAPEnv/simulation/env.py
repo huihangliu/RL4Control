@@ -11,6 +11,7 @@ from BGEnv.UVAPEnv.simulation.rendering import Viewer
 
 _Step = namedtuple("Step", ["observation", "reward", "done", "info"])
 
+
 def Step(observation, reward, done, **kwargs):
     """
     Convenience method creating a namedtuple with the results of the
@@ -20,36 +21,54 @@ def Step(observation, reward, done, **kwargs):
     return _Step(observation, reward, done, kwargs)
 
 
-Observation = namedtuple('Observation', ['CGM'])
+Observation = namedtuple("Observation", ["CGM"])
 logger = logging.getLogger(__name__)
 
 
 class T1DSimEnv(object):
     # TODO: in process of removing risk_diff default and moving to platform
-    def __init__(self, patient, sensor, pump, scenario, sample_time=None, model=None, model_device=None, source_dir=None):
+    def __init__(
+        self,
+        patient,
+        sensor,
+        pump,
+        scenario,
+        sample_time=None,
+        model=None,
+        model_device=None,
+        source_dir=None,
+    ):
         self.patient = patient
         self.state = self.patient.state  # caching for model usage
         # TODO: make more general
-        norm_params_full = joblib.load('{}/BGEnv/UVAPEnv/params/adult_001_std_params.pkl'.format(source_dir))
-        new_mask = [True for _ in range(13)] + [True, False, False, True]  # throwing out BG and CGM
-        norm_params_new = {'mu': norm_params_full['mu'][new_mask],
-                           'std': norm_params_full['sigma'][new_mask]}
+        norm_params_full = joblib.load(
+            "{}/BGEnv/UVAPEnv/params/adult_001_std_params.pkl".format(source_dir)
+        )
+        new_mask = [True for _ in range(13)] + [
+            True,
+            False,
+            False,
+            True,
+        ]  # throwing out BG and CGM
+        norm_params_new = {
+            "mu": norm_params_full["mu"][new_mask],
+            "std": norm_params_full["sigma"][new_mask],
+        }
         self.norm_params = norm_params_new
         self.sensor = sensor
         self.pump = pump
         self.scenario = scenario
-        self.perm_sample_time = sample_time
+        self.perm_sample_time = sample_time  # 自定义的采样时间, 在原始代码中没有使用.
         self.model = model
         self.model_device = model_device
         self._reset()
-
 
     @property
     def time(self):
         return self.scenario.start_time + timedelta(minutes=self.patient.t)
 
     def mini_step(self, action, cho):
-        # current action
+        # current action: this function would bound the action to the limits of the pump
         patient_action = self.scenario.get_action(self.time)
         basal = self.pump.basal(action.basal)
         bolus = self.pump.bolus(action.bolus)
@@ -70,9 +89,9 @@ class T1DSimEnv(object):
         return CHO, insulin, BG, CGM
 
     def step(self, action, reward_fun, cho):
-        '''
+        """
         action is a namedtuple with keys: basal, bolus
-        '''
+        """
         CHO = 0.0
         insulin = 0.0
         BG = 0.0
@@ -93,23 +112,29 @@ class T1DSimEnv(object):
                 self.patient._t += 1  # copying mini-step of 1 minute
             # Make state
             state = np.concatenate([self.state, [CHO, insulin]])
-            norm_state = ((state-self.norm_params['mu'])/self.norm_params['std']).reshape(1, -1)
+            norm_state = (
+                (state - self.norm_params["mu"]) / self.norm_params["std"]
+            ).reshape(1, -1)
             tensor_state = torch.from_numpy(norm_state).float().to(self.model_device)
             # feed through model
             with torch.no_grad():
                 next_state_tensor = self.model(tensor_state)
-                if self.model_device != 'cpu':
+                if self.model_device != "cpu":
                     next_state_tensor = next_state_tensor.cpu()
                 next_state_norm = next_state_tensor.numpy().reshape(-1)
-            next_state = (next_state_norm*self.norm_params['std'][:13])+self.norm_params['mu'][:13]
+            next_state = (
+                next_state_norm * self.norm_params["std"][:13]
+            ) + self.norm_params["mu"][:13]
             self.state = next_state
             # calculate BG and CGM
-            BG = self.state[12]/self.patient._params.Vg
-            self.patient._state[12] = self.state[12]  # getting observation correct for CGM measurement
+            BG = self.state[12] / self.patient._params.Vg
+            self.patient._state[12] = self.state[12]
+            # getting observation correct for CGM measurement
             CGM = self.sensor.measure(self.patient)
         else:
-            for _ in range(int(self.sample_time)): 
-                # 一次计算一个 sample_time (5 min) 的数据, 此时用同一个 action
+            for _ in range(int(self.sample_time)):
+                # self.sample_time = 5 min, I guess this means the mini_step evaluates the patient for each minute, so here it loops for self.sample_time times
+                # 在 1:self.sample_time 时间段内, 使用同一个 action 与 cho, 并计算这段时间的平均输出值作为这段时间的测量值
                 # Compute moving average as the sample measurements, 用平均值作为这段时间的测量值
                 tmp_CHO, tmp_insulin, tmp_BG, tmp_CGM = self.mini_step(action, cho)
                 CHO += tmp_CHO / self.sample_time
@@ -137,8 +162,13 @@ class T1DSimEnv(object):
         # Compute reward, and decide whether game is over
         window_size = int(60 / self.sample_time)
         BG_last_hour = self.CGM_hist[-window_size:]
-        reward = reward_fun(bg_hist=self.BG_hist, cgm_hist=self.CGM_hist, insulin_hist=self.insulin_hist, risk_hist=self.risk_hist)
-        done = BG < 40 or BG > 350
+        reward = reward_fun(
+            bg_hist=self.BG_hist,
+            cgm_hist=self.CGM_hist,
+            insulin_hist=self.insulin_hist,
+            risk_hist=self.risk_hist,
+        )
+        done = BG < 40 or BG > 350  # this maybe useless, done 在父类中没有被使用.
         obs = Observation(CGM=CGM)
 
         return Step(
@@ -148,11 +178,13 @@ class T1DSimEnv(object):
             sample_time=self.sample_time,
             patient_name=self.patient.name,
             meal=CHO,
-            patient_state=self.patient.state)
+            patient_state=self.patient.state,
+            flag_failure=BG < 5.0,  # 用来判断真实血糖是否低于 5.0 mmol/L.
+        )
 
     def _reset(self):
         if self.perm_sample_time is None:
-            self.sample_time = self.sensor.sample_time
+            self.sample_time = self.sensor.sample_time  # sensor sample time
         else:
             self.sample_time = self.perm_sample_time
         self.viewer = None
@@ -191,7 +223,9 @@ class T1DSimEnv(object):
             sample_time=self.sample_time,
             patient_name=self.patient.name,
             meal=0,
-            patient_state=self.patient.state)
+            patient_state=self.patient.state,
+            flag_failure=False,  # 用来判断是否出现失效, 初始状态不检查.
+        )
 
     def render(self, close=False):
         if close:
@@ -207,14 +241,14 @@ class T1DSimEnv(object):
 
     def show_history(self):
         df = pd.DataFrame()
-        df['Time'] = pd.Series(self.time_hist)
-        df['BG'] = pd.Series(self.BG_hist)
-        df['CGM'] = pd.Series(self.CGM_hist)
-        df['CHO'] = pd.Series(self.CHO_hist)
-        df['insulin'] = pd.Series(self.insulin_hist)
-        df['LBGI'] = pd.Series(self.LBGI_hist)
-        df['HBGI'] = pd.Series(self.HBGI_hist)
-        df['Risk'] = pd.Series(self.risk_hist)
-        df['Magni_Risk'] = pd.Series(self.magni_risk_hist)
-        df = df.set_index('Time')
+        df["Time"] = pd.Series(self.time_hist)
+        df["BG"] = pd.Series(self.BG_hist)
+        df["CGM"] = pd.Series(self.CGM_hist)
+        df["CHO"] = pd.Series(self.CHO_hist)
+        df["insulin"] = pd.Series(self.insulin_hist)
+        df["LBGI"] = pd.Series(self.LBGI_hist)
+        df["HBGI"] = pd.Series(self.HBGI_hist)
+        df["Risk"] = pd.Series(self.risk_hist)
+        df["Magni_Risk"] = pd.Series(self.magni_risk_hist)
+        df = df.set_index("Time")
         return df

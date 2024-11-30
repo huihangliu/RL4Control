@@ -6,6 +6,7 @@ import pkg_resources
 
 logger = logging.getLogger(__name__)
 
+
 class CGMSensor(object):
     def __init__(self, params, seed=None):
         self._params = params
@@ -21,7 +22,7 @@ class CGMSensor(object):
         return cls(params, **kwargs)
 
     def measure(self, patient):
-        if patient.t % self.sample_time == 0: # update CGM per sample time
+        if patient.t % self.sample_time == 0:  # update CGM per sample time
             BG = patient.observation.Gsub
             CGM = BG + next(self._noise_generator)
             CGM = max(CGM, self._params["min"])
@@ -42,10 +43,10 @@ class CGMSensor(object):
         self._noise_generator = CGMNoise(self._params, seed=seed)
 
     def reset(self):
-        logger.debug('Resetting CGM sensor ...')
+        logger.debug("Resetting CGM sensor ...")
         self._noise_generator = CGMNoise(self._params, seed=self.seed)
         self._last_CGM = 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     pass
